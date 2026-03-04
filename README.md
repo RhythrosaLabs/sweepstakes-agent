@@ -287,15 +287,29 @@ sweepstakes-agent/
 
 ## Cost Considerations
 
-This agent uses Anthropic's Claude API. Typical costs:
+This agent uses Anthropic's Claude API. Choose a model based on your budget:
 
-| Operation | Model | Approximate Cost |
-|-----------|-------|-----------------|
-| Discovery (per site) | claude-sonnet-4-6 | ~$0.05–0.15 |
-| Entry (per sweepstakes) | claude-sonnet-4-6 | ~$0.05–0.20 |
-| Full run (5 entries) | claude-sonnet-4-6 | ~$0.50–1.50 |
+### Available Models
 
-Use `claude-sonnet-4-6` (default) for a good balance of cost and capability. Use `claude-opus-4-6` for more complex entry forms.
+| Model | Input Cost | Output Cost | Best For |
+|-------|-----------|-------------|----------|
+| `claude-3-haiku-20240307` | $0.25/MTok | $1.25/MTok | Ultra-budget, simple forms |
+| `claude-3-5-haiku-20241022` | $0.80/MTok | $4/MTok | Budget-friendly, good quality |
+| `claude-haiku-4-5` | $1/MTok | $5/MTok | Fast & cheap, works for most entries |
+| `claude-sonnet-4-6` | $3/MTok | $15/MTok | **Recommended default** — balanced |
+| `claude-opus-4-6` | $5/MTok | $25/MTok | Most capable, complex forms |
+
+### Typical Costs Per Run
+
+| Operation | Haiku 4.5 | Sonnet 4.6 | Opus 4.6 |
+|-----------|-----------|------------|----------|
+| Discovery (per site) | ~$0.01–0.05 | ~$0.05–0.15 | ~$0.08–0.25 |
+| Entry (per sweepstakes) | ~$0.02–0.07 | ~$0.05–0.20 | ~$0.10–0.35 |
+| Full run (5 entries) | ~$0.15–0.50 | ~$0.50–1.50 | ~$0.80–2.50 |
+
+> **Tip:** Start with `claude-haiku-4-5` to test at low cost. Switch to `claude-sonnet-4-6` if you need better accuracy on complex forms. The extraction and fallback LLMs automatically use Haiku to keep costs down.
+
+Change the model in the Settings tab, or set `SWEEPS_LLM_MODEL` in your `.env` file.
 
 ## Disclaimer
 

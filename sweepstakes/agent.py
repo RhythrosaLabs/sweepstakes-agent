@@ -68,12 +68,13 @@ def get_llm(model: str = "claude-sonnet-4-6"):
 
 
 def get_fallback_llm():
-    return ChatAnthropic(model="claude-sonnet-4-6")
+    """Fallback model — uses Haiku for lower cost."""
+    return ChatAnthropic(model="claude-haiku-4-5")
 
 
 def get_extraction_llm():
     """Cheaper model for page extraction during discovery."""
-    return ChatAnthropic(model="claude-sonnet-4-6")
+    return ChatAnthropic(model="claude-haiku-4-5")
 
 
 # ── Sensitive data ────────────────────────────────────────────

@@ -544,9 +544,16 @@ def build_settings_tab():
         with gr.Row():
             with gr.Column():
                 model_dd = gr.Dropdown(
-                    ["claude-sonnet-4-6", "claude-opus-4-6", "claude-haiku-4-5-20251001"],
+                    [
+                        "claude-haiku-4-5",          # $1/$5 per MTok — fastest & cheapest
+                        "claude-sonnet-4-6",         # $3/$15 per MTok — balanced (default)
+                        "claude-opus-4-6",           # $5/$25 per MTok — most capable
+                        "claude-3-5-haiku-20241022", # $0.80/$4 per MTok — legacy budget
+                        "claude-3-haiku-20240307",   # $0.25/$1.25 per MTok — ultra budget
+                    ],
                     value=_config.llm_model,
                     label="LLM Model",
+                    info="Cheaper models work fine for simple entries; use Sonnet/Opus for complex forms",
                 )
                 max_entries = gr.Slider(1, 20, _config.max_entries_per_run, step=1, label="Max entries per run")
                 min_score = gr.Slider(0, 100, _config.min_safety_score, step=5, label="Min safety score")
