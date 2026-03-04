@@ -8,6 +8,33 @@ An AI-powered agent that automatically discovers and enters free, legitimate swe
   <img src="https://img.shields.io/badge/browser--use-0.12+-purple.svg" alt="browser-use 0.12+">
 </p>
 
+## Screenshots
+
+<p align="center">
+  <img src="screenshots/dashboard.png" alt="Dashboard — stats overview" width="700">
+</p>
+<p align="center"><em>Dashboard — stats overview with cost tracking</em></p>
+
+<p align="center">
+  <img src="screenshots/discover.png" alt="Discover tab" width="700">
+</p>
+<p align="center"><em>Discover — parallel aggregator scanning</em></p>
+
+<p align="center">
+  <img src="screenshots/enter.png" alt="Enter tab" width="700">
+</p>
+<p align="center"><em>Enter — auto-fill and submit sweepstakes forms</em></p>
+
+<p align="center">
+  <img src="screenshots/history.png" alt="History tab" width="700">
+</p>
+<p align="center"><em>History — track all entries and results</em></p>
+
+<p align="center">
+  <img src="screenshots/settings.png" alt="Settings tab" width="700">
+</p>
+<p align="center"><em>Settings — model selection, browser config, aggregator sites</em></p>
+
 ## Features
 
 - **Parallel Discovery** — Scans 8 aggregator sites concurrently with `asyncio.gather` and a configurable semaphore (3 at a time), dramatically faster than sequential scanning
