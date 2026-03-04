@@ -1,17 +1,20 @@
 """
-Sweepstakes Discovery & Entry Agent — v4
+Sweepstakes Discovery & Entry Agent — v5
 
 Strategy: Only enter sweepstakes that require minimal info (email + name).
 Skip anything requiring phone, DOB, address, CAPTCHA, or complex widgets.
-Uses multiple aggregator sites. Detects failures early and moves on.
+Uses parallel discovery, tiered models, browser reuse, and cost tracking.
 """
 
 import asyncio
 import json
 import logging
 import re
+import ssl
+import time
 from datetime import datetime
 from pathlib import Path
+from urllib.parse import urlparse
 
 from dotenv import load_dotenv
 
@@ -63,8 +66,25 @@ async def _on_step(browser_state, agent_output, step):
 
 # ── LLM helpers ───────────────────────────────────────────────
 
+# Model pricing per million tokens (input, output)
+MODEL_PRICING = {
+    "claude-opus-4-6": (5.0, 25.0),
+    "claude-sonnet-4-6": (3.0, 15.0),
+    "claude-haiku-4-5": (1.0, 5.0),
+    "claude-3-5-haiku-20241022": (0.80, 4.0),
+    "claude-3-haiku-20240307": (0.25, 1.25),
+}
+
+DISCOVERY_MODEL = "claude-haiku-4-5"  # always use cheapest for discovery
+
+
 def get_llm(model: str = "claude-sonnet-4-6"):
     return ChatAnthropic(model=model)
+
+
+def get_discovery_llm():
+    """Cheap model for discovery — just scraping links, doesn't need reasoning."""
+    return ChatAnthropic(model=DISCOVERY_MODEL)
 
 
 def get_fallback_llm():
@@ -75,6 +95,78 @@ def get_fallback_llm():
 def get_extraction_llm():
     """Cheaper model for page extraction during discovery."""
     return ChatAnthropic(model="claude-haiku-4-5")
+
+
+# ── Cost / token tracking ────────────────────────────────────
+
+class CostTracker:
+    """Track token usage and estimated API costs across runs."""
+
+    def __init__(self):
+        self.reset()
+
+    def reset(self):
+        self.runs: list[dict] = []
+        self._current_run: dict | None = None
+
+    def start_run(self, phase: str, model: str):
+        self._current_run = {
+            "phase": phase,
+            "model": model,
+            "started": time.time(),
+            "input_tokens": 0,
+            "output_tokens": 0,
+            "steps": 0,
+        }
+
+    def record_step(self, input_tokens: int = 0, output_tokens: int = 0):
+        if self._current_run:
+            self._current_run["input_tokens"] += input_tokens
+            self._current_run["output_tokens"] += output_tokens
+            self._current_run["steps"] += 1
+
+    def end_run(self):
+        if self._current_run:
+            self._current_run["duration"] = time.time() - self._current_run["started"]
+            model = self._current_run["model"]
+            inp_price, out_price = MODEL_PRICING.get(model, (3.0, 15.0))
+            inp_cost = self._current_run["input_tokens"] / 1_000_000 * inp_price
+            out_cost = self._current_run["output_tokens"] / 1_000_000 * out_price
+            self._current_run["estimated_cost"] = inp_cost + out_cost
+            self.runs.append(self._current_run)
+            self._current_run = None
+
+    @property
+    def total_cost(self) -> float:
+        return sum(r.get("estimated_cost", 0) for r in self.runs)
+
+    @property
+    def total_input_tokens(self) -> int:
+        return sum(r.get("input_tokens", 0) for r in self.runs)
+
+    @property
+    def total_output_tokens(self) -> int:
+        return sum(r.get("output_tokens", 0) for r in self.runs)
+
+    def summary(self) -> str:
+        if not self.runs:
+            return "No API usage recorded yet."
+        lines = [f"**Total estimated cost:** ${self.total_cost:.4f}"]
+        lines.append(f"**Tokens:** {self.total_input_tokens:,} in / {self.total_output_tokens:,} out")
+        lines.append(f"**Runs:** {len(self.runs)}")
+        for r in self.runs:
+            cost = r.get("estimated_cost", 0)
+            dur = r.get("duration", 0)
+            lines.append(
+                f"  - {r['phase']} ({r['model']}): "
+                f"${cost:.4f} | {r['input_tokens']:,}+{r['output_tokens']:,} tok | "
+                f"{r['steps']} steps | {dur:.0f}s"
+            )
+        return "\n".join(lines)
+
+
+# Global cost tracker — shared across UI and agent
+cost_tracker = CostTracker()
 
 
 # ── Sensitive data ────────────────────────────────────────────
@@ -150,10 +242,10 @@ When filling forms, type these placeholder keys (auto-replaced with real values)
 - ZIP code → x_zip_code
 - Country → x_country
 
-### IMPORTANT — Fields you may NOT have:
-- Phone number (x_phone) — If phone is REQUIRED, call done(success=false, notes="Phone number required but not available")
-- Date of birth (x_date_of_birth) — If DOB is REQUIRED, call done(success=false, notes="DOB required but not available")
-- Street address (x_street_address) — If full address is REQUIRED, call done(success=false, notes="Street address required but not available")
+### IMPORTANT — Fields you do NOT have:
+- Phone number (x_phone) — NOT available. If phone is REQUIRED, call done(success=false, notes="Phone number required but not available")
+- Date of birth (x_date_of_birth) — NOT available. If DOB is REQUIRED, call done(success=false, notes="DOB required but not available")
+- Street address (x_street_address) — NOT available. If full address is REQUIRED, call done(success=false, notes="Street address required but not available")
 
 If a phone/DOB/address field exists but is OPTIONAL (not marked required, no asterisk), you can leave it blank and submit.
 
@@ -201,6 +293,67 @@ AGGREGATOR_DOMAINS = [
 
 def is_aggregator_url(url: str) -> bool:
     return any(d in url.lower() for d in AGGREGATOR_DOMAINS)
+
+
+# ── Pre-flight URL check ─────────────────────────────────────
+
+async def preflight_check(url: str, timeout: float = 10.0) -> tuple[bool, str]:
+    """Quick HTTP check — verify URL is live and likely has a form.
+    Returns (ok, reason). Costs zero LLM tokens."""
+
+    # Skip preflight for known entry platforms — they block bots but work in browsers
+    known_platforms = ["gleam.io", "rafflecopter.com", "promosimple.com",
+                       "viralsweep.com", "woobox.com", "shortstack.com",
+                       "second-street.com", "eprize.com"]
+    url_lower = url.lower()
+    if any(p in url_lower for p in known_platforms):
+        return True, f"Known entry platform — skipping preflight"
+
+    try:
+        import aiohttp
+    except ImportError:
+        return True, "aiohttp not installed — skipping preflight"
+
+    try:
+        ssl_ctx = ssl.create_default_context()
+        ssl_ctx.check_hostname = False
+        ssl_ctx.verify_mode = ssl.CERT_NONE
+        connector = aiohttp.TCPConnector(ssl=ssl_ctx)
+        async with aiohttp.ClientSession(connector=connector) as session:
+            headers = {
+                "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+                              "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+                "Accept-Encoding": "gzip, deflate",  # skip brotli
+            }
+            async with session.get(url, timeout=aiohttp.ClientTimeout(total=timeout),
+                                   headers=headers, allow_redirects=True) as resp:
+                if resp.status == 403:
+                    # Many sites block bots but work in a real browser — let it through
+                    return True, "HTTP 403 (anti-bot) — will try in browser"
+                if resp.status >= 400:
+                    return False, f"HTTP {resp.status}"
+                content_type = resp.headers.get("content-type", "")
+                if "text/html" not in content_type and "application" not in content_type:
+                    return False, f"Not HTML: {content_type[:40]}"
+                # Read first 50KB to check for form indicators
+                body = await resp.content.read(50_000)
+                text = body.decode("utf-8", errors="ignore").lower()
+                form_signals = ["<form", "<input", "type=\"email\"", "type='email'",
+                                "gleam.io", "rafflecopter", "promosimple", "viralsweep",
+                                "woobox", "enter now", "submit entry", "sweepstakes"]
+                has_form = any(s in text for s in form_signals)
+                if not has_form:
+                    return False, "No form or entry signals found on page"
+                return True, "OK"
+    except asyncio.TimeoutError:
+        return False, "Timeout"
+    except Exception as e:
+        # DNS or connection errors — dead link
+        err = str(e)[:60]
+        if "Cannot connect" in err or "Name or service not known" in err:
+            return False, f"Dead link: {err}"
+        # Other errors — give benefit of the doubt (some sites block bots)
+        return True, f"Preflight inconclusive: {err}"
 
 
 # ── Discovery ────────────────────────────────────────────────
@@ -284,106 +437,206 @@ async def discover_sweepstakes(
     profile: EntrantProfile,
     tracker: EntryTracker,
     on_step=None,
+    max_concurrent: int = 3,
 ) -> list[dict]:
-    """Discover sweepstakes from aggregator sites. Uses ALL configured sites."""
+    """Discover sweepstakes from aggregator sites in parallel.
+
+    Uses cheap Haiku model for discovery (tiered strategy).
+    Runs up to max_concurrent scrapers simultaneously.
+    Post-processes to resolve aggregator URLs and preflight-check targets.
+    """
     logger.info("=" * 60)
-    logger.info("  PHASE 1: Discovering Sweepstakes")
+    logger.info("  PHASE 1: Discovering Sweepstakes (parallel)")
     logger.info("=" * 60)
 
     already_entered = tracker.get_entered_urls()
-    llm = get_llm(config.llm_model)
+    # Tiered model: always use cheap model for discovery
+    discovery_llm = get_discovery_llm()
     fallback = get_fallback_llm()
     extraction_llm = get_extraction_llm()
     browser_profile = build_browser_profile(config)
 
-    all_sweepstakes = []
-    seen_urls = set()
+    semaphore = asyncio.Semaphore(max_concurrent)
+    all_results: list[list[dict]] = []
 
-    # Use ALL aggregator sites, stop when we have enough
-    for site_url in config.aggregator_sites:
-        if len(all_sweepstakes) >= config.max_entries_per_run * 2:
-            logger.info(f"  Have enough candidates ({len(all_sweepstakes)}), skipping remaining sites")
-            break
+    async def _scrape_site(site_url: str) -> list[dict]:
+        """Scrape one aggregator site (runs under semaphore)."""
+        async with semaphore:
+            logger.info(f"  🔍 Scraping: {site_url}")
+            cost_tracker.start_run(f"discover:{urlparse(site_url).netloc}", DISCOVERY_MODEL)
+            task = build_discovery_task(config, profile, already_entered, site_url)
+            try:
+                agent = Agent(
+                    task=task,
+                    llm=discovery_llm,
+                    fallback_llm=fallback,
+                    page_extraction_llm=extraction_llm,
+                    browser_profile=browser_profile,
+                    output_model_schema=DiscoveryResult,
+                    sensitive_data=build_sensitive_data(profile),
+                    initial_actions=[{"navigate": {"url": site_url}}],
+                    max_actions_per_step=8,
+                    use_vision=True,
+                    max_failures=3,
+                    enable_planning=False,
+                    use_thinking=True,
+                    extend_system_message=SWEEPSTAKES_PERSONA,
+                    register_new_step_callback=on_step or _on_step,
+                    generate_gif=False,
+                    final_response_after_failure=True,
+                    message_compaction=True,
+                    loop_detection_enabled=True,
+                    include_attributes=["href", "data-url", "target", "rel"],
+                )
+                result = await agent.run(max_steps=20)
 
-        logger.info(f"  Scraping: {site_url}")
-        task = build_discovery_task(config, profile, already_entered, site_url)
+                # Extract token usage from agent history
+                if result and hasattr(result, 'history'):
+                    for item in result.history:
+                        if hasattr(item, 'metadata') and item.metadata:
+                            inp = getattr(item.metadata, 'input_tokens', 0) or 0
+                            out = getattr(item.metadata, 'output_tokens', 0) or 0
+                            cost_tracker.record_step(inp, out)
 
-        try:
-            agent = Agent(
-                task=task,
-                llm=llm,
-                fallback_llm=fallback,
-                page_extraction_llm=extraction_llm,
-                browser_profile=browser_profile,
-                output_model_schema=DiscoveryResult,
-                sensitive_data=build_sensitive_data(profile),
-                initial_actions=[{"navigate": {"url": site_url}}],
-                max_actions_per_step=8,
-                use_vision=True,
-                max_failures=3,
-                enable_planning=False,
-                use_thinking=True,
-                extend_system_message=SWEEPSTAKES_PERSONA,
-                register_new_step_callback=on_step or _on_step,
-                generate_gif=False,
-                final_response_after_failure=True,
-                message_compaction=True,
-                loop_detection_enabled=True,
-                include_attributes=["href", "data-url", "target", "rel"],
-            )
+                if result and result.final_result():
+                    raw = result.final_result()
+                    items = _parse_discovery_result(raw)
+                    logger.info(f"    ✅ Found {len(items)} from {site_url}")
+                    cost_tracker.end_run()
+                    return items
+                else:
+                    logger.info(f"    ⚪ No results from {site_url}")
+                    cost_tracker.end_run()
+                    return []
+            except Exception as e:
+                logger.error(f"    ❌ Error scraping {site_url}: {e}")
+                cost_tracker.end_run()
+                return []
 
-            result = await agent.run(max_steps=20)
+    # Launch all scrapers in parallel (bounded by semaphore)
+    tasks = [_scrape_site(site_url) for site_url in config.aggregator_sites]
+    all_results = await asyncio.gather(*tasks, return_exceptions=True)
 
-            if result and result.final_result():
-                raw = result.final_result()
-                items = _parse_discovery_result(raw)
-                # Deduplicate
-                for item in items:
-                    url = item.get("url", "")
-                    if url and url not in seen_urls:
-                        seen_urls.add(url)
-                        all_sweepstakes.append(item)
-                logger.info(f"    Found {len(items)} from {site_url}")
-            else:
-                logger.info(f"    No results from {site_url}")
-
-        except Exception as e:
-            logger.error(f"    Error scraping {site_url}: {e}")
+    # Flatten and deduplicate
+    seen_urls: set[str] = set()
+    all_sweepstakes: list[dict] = []
+    for result_or_exc in all_results:
+        if isinstance(result_or_exc, Exception):
+            logger.error(f"    Scraper exception: {result_or_exc}")
             continue
+        for item in result_or_exc:
+            url = item.get("url", "")
+            if url and url not in seen_urls:
+                seen_urls.add(url)
+                all_sweepstakes.append(item)
 
-    # Validate and filter
-    validated = []
+    logger.info(f"  Raw discovered: {len(all_sweepstakes)} from {len(config.aggregator_sites)} sites")
+
+    # ── URL Resolution: resolve aggregator blog URLs to real entry URLs ──
+    resolved = []
     for sw in all_sweepstakes:
         url = sw.get("url", "")
         if not url:
             continue
-
-        # Skip if it's still an aggregator URL (discovery failed to find real link)
         if is_aggregator_url(url):
-            logger.info(f"    Skipped aggregator URL: {url[:60]}")
-            continue
+            logger.info(f"    🔗 Resolving aggregator URL: {url[:60]}")
+            real_url = await _resolve_entry_url(url, browser_profile)
+            if real_url and not is_aggregator_url(real_url):
+                logger.info(f"       → {real_url[:60]}")
+                sw["url"] = real_url
+                sw["_original_aggregator_url"] = url
+                resolved.append(sw)
+            else:
+                logger.info(f"       ⏭️  Could not resolve, skipping")
+        else:
+            resolved.append(sw)
 
-        # Quick validation
+    # ── Pre-flight check: verify URLs are live ──
+    logger.info(f"  Pre-flight checking {len(resolved)} URLs...")
+    preflight_tasks = [preflight_check(sw.get("url", "")) for sw in resolved]
+    preflight_results = await asyncio.gather(*preflight_tasks)
+
+    live = []
+    for sw, (ok, reason) in zip(resolved, preflight_results):
+        if ok:
+            live.append(sw)
+        else:
+            logger.info(f"    ⛔ Preflight failed: {sw.get('name', '?')[:40]} — {reason}")
+
+    # ── Validate and filter ──
+    validated = []
+    for sw in live:
+        url = sw.get("url", "")
         v = quick_validate(
             url=url,
             name=sw.get("name", ""),
             sponsor=sw.get("sponsor", ""),
             trusted_sponsors=config.trusted_sponsors,
         )
-
         if v.is_valid:
             sw["_validation_score"] = v.score
             validated.append(sw)
-            logger.info(f"    PASS {sw.get('name', '?')[:40]} (score: {v.score})")
+            logger.info(f"    ✅ {sw.get('name', '?')[:40]} (score: {v.score})")
         else:
-            logger.info(f"    FAIL Filtered: {sw.get('name', '?')[:40]} — {'; '.join(v.red_flags[:2])}")
+            logger.info(f"    ❌ Filtered: {sw.get('name', '?')[:40]} — {'; '.join(v.red_flags[:2])}")
 
     # Sort by score (highest first), then limit
     validated.sort(key=lambda x: x.get("_validation_score", 50), reverse=True)
     validated = validated[:config.max_entries_per_run]
 
-    logger.info(f"Discovered {len(validated)} valid sweepstakes (filtered from {len(all_sweepstakes)})")
+    logger.info(f"Discovered {len(validated)} valid sweepstakes (from {len(all_sweepstakes)} raw)")
+    logger.info(f"  Discovery cost: ${cost_tracker.total_cost:.4f}")
     return validated
+
+
+async def _resolve_entry_url(aggregator_url: str, browser_profile: BrowserProfile) -> str | None:
+    """Visit an aggregator blog post and extract the real entry URL.
+    Uses Haiku — very cheap. Returns resolved URL or None."""
+    try:
+        resolve_llm = get_discovery_llm()
+        cost_tracker.start_run("resolve_url", DISCOVERY_MODEL)
+        agent = Agent(
+            task=f"""Find the REAL entry URL on this page.
+This is a blog post about a sweepstakes. Find the outbound link to the actual entry page.
+Look for: "Enter Now", "Enter Sweepstakes", "Enter Here", "Click to Enter", or similar.
+The link should go to an EXTERNAL domain (gleam.io, sponsor.com, woobox.com, etc.).
+Return ONLY the URL as a plain string, nothing else.""",
+            llm=resolve_llm,
+            browser_profile=browser_profile,
+            initial_actions=[{"navigate": {"url": aggregator_url}}],
+            max_actions_per_step=4,
+            use_vision=False,
+            max_failures=2,
+            enable_planning=False,
+            use_thinking=False,
+            generate_gif=False,
+            final_response_after_failure=True,
+            message_compaction=True,
+            include_attributes=["href", "target", "rel"],
+        )
+        result = await agent.run(max_steps=5)
+
+        if result and hasattr(result, 'history'):
+            for item in result.history:
+                if hasattr(item, 'metadata') and item.metadata:
+                    inp = getattr(item.metadata, 'input_tokens', 0) or 0
+                    out = getattr(item.metadata, 'output_tokens', 0) or 0
+                    cost_tracker.record_step(inp, out)
+
+        cost_tracker.end_run()
+
+        if result and result.final_result():
+            raw = result.final_result()
+            # Extract URL from response
+            if isinstance(raw, str):
+                match = re.search(r'https?://\S+', raw)
+                if match:
+                    return match.group().rstrip('.,;)"\'')
+        return None
+    except Exception as e:
+        logger.debug(f"URL resolve failed for {aggregator_url}: {e}")
+        cost_tracker.end_run()
+        return None
 
 
 def _parse_discovery_result(raw) -> list[dict]:
@@ -421,7 +674,7 @@ def build_entry_task(
     missing_text = ""
     if missing_fields:
         missing_text = f"""
-## Fields NOT Available (do NOT make up values):
+## ⛔ Fields NOT Available (do NOT make up values):
 {', '.join(missing_fields)}
 If any of these are REQUIRED by the form (marked with *, required attribute, or form won't submit without them):
 → Call done(success=false, notes="Required field [X] not available") immediately.
@@ -535,7 +788,8 @@ async def enter_sweepstakes(
     browser_session: BrowserSession | None = None,
     on_step=None,
 ) -> bool:
-    """Enter a single sweepstakes. Returns True on success."""
+    """Enter a single sweepstakes. Returns True on success.
+    Uses the user's chosen model (tiered strategy — entry needs accuracy)."""
     name = sweepstakes_info.get("name", "Unknown")
     url = sweepstakes_info.get("url", "")
 
@@ -543,7 +797,14 @@ async def enter_sweepstakes(
     logger.info(f"  URL: {url}")
 
     if tracker.has_entered(url):
-        logger.info("  Already entered")
+        logger.info("  ⏭️  Already entered")
+        return False
+
+    # Pre-flight check (free — no LLM tokens)
+    pf_ok, pf_reason = await preflight_check(url)
+    if not pf_ok:
+        logger.info(f"  ⛔ Preflight failed: {pf_reason}")
+        tracker.skip_entry(name, url, f"Preflight: {pf_reason}")
         return False
 
     # Pre-entry validation
@@ -555,16 +816,20 @@ async def enter_sweepstakes(
     )
 
     if not pre_val.is_valid and pre_val.red_flags:
-        logger.info(f"  Pre-validation failed: {'; '.join(pre_val.red_flags[:2])}")
+        logger.info(f"  ❌ Pre-validation failed: {'; '.join(pre_val.red_flags[:2])}")
         tracker.skip_entry(name, url, f"Pre-validation failed: {'; '.join(pre_val.red_flags)}")
         return False
 
     validation_context = format_validation_for_prompt(pre_val)
     task = build_entry_task(sweepstakes_info, profile, config, validation_context)
 
-    llm = get_llm(config.llm_model)
+    # Tiered model: use user's chosen model for ENTRY (accuracy matters)
+    entry_model = config.llm_model
+    llm = get_llm(entry_model)
     fallback = get_fallback_llm()
     browser_profile = build_browser_profile(config)
+
+    cost_tracker.start_run(f"entry:{name[:30]}", entry_model)
 
     kwargs = dict(
         task=task,
@@ -598,6 +863,16 @@ async def enter_sweepstakes(
     max_steps = 20 if is_aggregator_url(url) else 15
     result = await agent.run(max_steps=max_steps)
 
+    # Extract token usage
+    if result and hasattr(result, 'history'):
+        for item in result.history:
+            if hasattr(item, 'metadata') and item.metadata:
+                inp = getattr(item.metadata, 'input_tokens', 0) or 0
+                out = getattr(item.metadata, 'output_tokens', 0) or 0
+                cost_tracker.record_step(inp, out)
+
+    cost_tracker.end_run()
+
     # Parse result
     success = False
     notes = ""
@@ -623,9 +898,10 @@ async def enter_sweepstakes(
     )
     tracker.add_entry(entry)
 
-    logger.info(f"  {'Entered' if success else 'Failed'}: {name}")
+    logger.info(f"  {'✅ Entered' if success else '❌ Failed'}: {name}")
     if not success and notes:
         logger.info(f"    Reason: {notes[:100]}")
+    logger.info(f"  Running cost: ${cost_tracker.total_cost:.4f}")
     return success
 
 
@@ -707,7 +983,8 @@ async def run_sweepstakes_agent(
         logger.error(f"Missing: {missing}")
         return
 
-    logger.info("SWEEPSTAKES AGENT v4")
+    logger.info("🎰 SWEEPSTAKES AGENT v5")
+    cost_tracker.reset()
     tracker = EntryTracker(config.entry_log_path)
 
     sweeps = await discover_sweepstakes(config, profile, tracker)
@@ -715,18 +992,30 @@ async def run_sweepstakes_agent(
         logger.warning("No sweepstakes found.")
         return
 
+    # Reuse a single browser session across all entries
+    browser_profile = build_browser_profile(config)
+    session = BrowserSession(browser_profile=browser_profile)
+
     entered = 0
-    for i, sw in enumerate(sweeps):
-        if entered >= config.max_entries_per_run:
-            break
+    try:
+        for i, sw in enumerate(sweeps):
+            if entered >= config.max_entries_per_run:
+                break
+            try:
+                if await enter_sweepstakes(sw, config, profile, tracker,
+                                           browser_session=session):
+                    entered += 1
+            except Exception as e:
+                logger.error(f"Error: {e}")
+                tracker.skip_entry(sw.get("name", "?"), sw.get("url", ""), str(e))
+    finally:
         try:
-            if await enter_sweepstakes(sw, config, profile, tracker):
-                entered += 1
-        except Exception as e:
-            logger.error(f"Error: {e}")
-            tracker.skip_entry(sw.get("name", "?"), sw.get("url", ""), str(e))
+            await session.close()
+        except Exception:
+            pass
 
     tracker.print_summary()
+    print("\n" + cost_tracker.summary())
 
 
 async def enter_single_url(url: str, config: SweepstakesConfig, profile: EntrantProfile):
@@ -788,18 +1077,12 @@ Examples:
     config = SweepstakesConfig()
     profile = EntrantProfile()
 
-    if args.max_entries:
-        config.max_entries_per_run = args.max_entries
-    if args.categories:
-        config.categories_of_interest = [c.strip() for c in args.categories.split(",")]
-    if args.headless:
-        config.headless = True
-    if args.no_demo:
-        config.demo_mode = False
-    if args.model:
-        config.llm_model = args.model
-    if args.log_path:
-        config.entry_log_path = args.log_path
+    if args.max_entries: config.max_entries_per_run = args.max_entries
+    if args.categories: config.categories_of_interest = [c.strip() for c in args.categories.split(",")]
+    if args.headless: config.headless = True
+    if args.no_demo: config.demo_mode = False
+    if args.model: config.llm_model = args.model
+    if args.log_path: config.entry_log_path = args.log_path
 
     if args.enter_url:
         asyncio.run(enter_single_url(args.enter_url, config, profile))

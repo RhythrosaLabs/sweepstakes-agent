@@ -10,7 +10,12 @@ An AI-powered agent that automatically discovers and enters free, legitimate swe
 
 ## Features
 
-- **Smart Discovery** — Scans 8 reputable sweepstakes aggregator sites to find open contests
+- **Parallel Discovery** — Scans 8 aggregator sites concurrently with `asyncio.gather` and a configurable semaphore (3 at a time), dramatically faster than sequential scanning
+- **Tiered Model Strategy** — Discovery and URL extraction always use the cheapest model (Haiku); your chosen model is only used for actual form entry, cutting costs 3–5×
+- **Browser Session Reuse** — A single `BrowserSession` is shared across all entries in a run, eliminating per-entry Chromium launch overhead
+- **URL Resolution** — Aggregator blog-post URLs are automatically resolved to the real sweepstakes entry page before attempting entry
+- **Cost & Token Tracking** — Real-time per-run cost and token counters displayed in the dashboard and CLI summary
+- **Pre-flight URL Check** — Lightweight HTTP probe verifies that each URL is alive, returns HTML, and has form elements before spending LLM tokens on it
 - **Multi-Layer Scam Detection** — Domain reputation, payment language detection, urgency scam patterns, and legitimacy signals
 - **Auto-Entry** — Fills out and submits entry forms using your profile info with `sensitive_data` masking (the AI never sees your real data)
 - **Safety First** — Never enters financial info, never pays, never downloads anything
@@ -23,7 +28,7 @@ An AI-powered agent that automatically discovers and enters free, legitimate swe
 
 ### Phase 1: Discovery
 
-The agent visits trusted sweepstakes aggregator sites and finds currently-open sweepstakes that:
+The agent visits trusted sweepstakes aggregator sites **in parallel** (3 at a time by default) using the cheapest model (Haiku) and finds currently-open sweepstakes that:
 
 - Are **free to enter** (no purchase necessary)
 - Have **online entry forms** (not mail-only)
@@ -31,18 +36,24 @@ The agent visits trusted sweepstakes aggregator sites and finds currently-open s
 - Match your **eligibility** (country, age)
 - Don't require fields you haven't provided
 
+After discovery, each URL goes through:
+
+1. **URL Resolution** — If the URL points to an aggregator blog post, the agent visits it with Haiku and extracts the real entry URL
+2. **Pre-flight Check** — A lightweight HTTP probe confirms the URL is alive, returns HTML, and contains form elements before spending LLM tokens on it
+
 ### Phase 2: Entry
 
-For each validated sweepstakes, the agent:
+All entries share a single browser session for efficiency. For each validated sweepstakes, the agent:
 
-1. Navigates to the entry page
-2. Runs a safety check (payment language, scam patterns)
-3. Identifies form fields and checks which are required
-4. Fills the form using placeholder keys (real values injected via `sensitive_data`)
-5. Checks required checkboxes (rules agreement) and unchecks marketing opt-ins
-6. Submits the entry
-7. Verifies confirmation
-8. Logs the result
+1. Runs a pre-flight HTTP check (skips dead links/non-HTML pages)
+2. Navigates to the entry page (using the shared browser session)
+3. Runs a safety check (payment language, scam patterns)
+4. Identifies form fields and checks which are required
+5. Fills the form using placeholder keys (real values injected via `sensitive_data`)
+6. Checks required checkboxes (rules agreement) and unchecks marketing opt-ins
+7. Submits the entry
+8. Verifies confirmation
+9. Logs the result and records API cost/tokens
 
 ### Privacy & Security
 
@@ -287,7 +298,11 @@ sweepstakes-agent/
 
 ## Cost Considerations
 
-This agent uses Anthropic's Claude API. Choose a model based on your budget:
+This agent uses Anthropic's Claude API with a **tiered model strategy** to minimise costs:
+
+- **Discovery & URL resolution** always use `claude-haiku-4-5` (cheapest) regardless of your selected model
+- **Form entry** uses the model you select in Settings (default: `claude-sonnet-4-6`)
+- **Real-time cost tracking** shows cumulative API spend and token counts in the dashboard and CLI
 
 ### Available Models
 

@@ -1,5 +1,5 @@
 """
-Sweepstakes Agent — Gradio Web Dashboard
+Sweepstakes Agent — Gradio Web Dashboard v2
 
 Tabs:
   1. Dashboard — Stats, recent entries, quick actions
@@ -12,14 +12,14 @@ Tabs:
 
 import asyncio
 import json
-import os
 import re
-import sys
 import threading
 from datetime import datetime
 from pathlib import Path
 
 import gradio as gr
+
+from browser_use import BrowserSession
 
 from sweepstakes.config import EntrantProfile, SweepstakesConfig
 from sweepstakes.tracker import EntryTracker
@@ -49,7 +49,7 @@ def _progress_text():
 
 def build_dashboard():
     with gr.Column():
-        gr.Markdown("# Sweepstakes Agent Dashboard")
+        gr.Markdown("# 🎰 Sweepstakes Agent Dashboard")
 
         with gr.Row():
             with gr.Column(scale=1):
@@ -60,7 +60,7 @@ def build_dashboard():
         with gr.Row():
             recent_md = gr.Markdown(_render_recent(), elem_id="recent")
 
-        refresh_btn = gr.Button("Refresh", size="sm")
+        refresh_btn = gr.Button("🔄 Refresh", size="sm")
         refresh_btn.click(
             fn=lambda: (_render_stats(), _render_profile_card(), _render_recent()),
             outputs=[stats_md, profile_md, recent_md],
@@ -70,6 +70,7 @@ def build_dashboard():
 
 
 def _render_stats():
+    from sweepstakes.agent import cost_tracker
     stats = _tracker.get_stats()
     total = stats.get("total_entries", 0)
     entered = stats.get("entered", 0)
@@ -77,16 +78,20 @@ def _render_stats():
     skipped = stats.get("skipped", 0)
     rate = stats.get("success_rate", "N/A")
     value = stats.get("total_prize_value", "$0")
-    return f"""### Statistics
+    cost = f"${cost_tracker.total_cost:.4f}" if cost_tracker.total_cost > 0 else "$0"
+    tokens = f"{cost_tracker.total_input_tokens + cost_tracker.total_output_tokens:,}" if cost_tracker.total_input_tokens > 0 else "0"
+    return f"""### 📊 Statistics
 | Metric | Value |
 |--------|-------|
 | Total entries | **{total}** |
-| Entered | **{entered}** |
-| Failed | **{failed}** |
-| Skipped | **{skipped}** |
+| Entered | **{entered}** ✅ |
+| Failed | **{failed}** ❌ |
+| Skipped | **{skipped}** ⏭️ |
 | Success rate | **{rate}** |
 | Est. prize pool | **{value}** |
 | Discovered (session) | **{len(_discovered)}** |
+| API cost (session) | **{cost}** |
+| Tokens used | **{tokens}** |
 """
 
 
@@ -96,7 +101,7 @@ def _render_profile_card():
     total = p.total_fields
     pct = int(filled / total * 100) if total > 0 else 0
     bar = "█" * (pct // 5) + "░" * (20 - pct // 5)
-    return f"""### Profile: {p.first_name or '—'} {p.last_name or '—'}
+    return f"""### 👤 Profile: {p.first_name or '—'} {p.last_name or '—'}
 **Completeness:** {bar} {pct}% ({filled}/{total})
 
 | Field | Value |
@@ -110,7 +115,7 @@ def _render_profile_card():
 def _render_recent():
     recent = _tracker.get_recent(5)
     if not recent:
-        return "### Recent Entries\nNo entries yet."
+        return "### 🕐 Recent Entries\nNo entries yet."
     rows = []
     for e in recent:
         icon = "✅" if e.get("status") == "entered" else "❌" if e.get("status") == "failed" else "⏭️"
@@ -119,7 +124,7 @@ def _render_recent():
         date = e.get("entry_date", "?")[:10]
         rows.append(f"| {icon} | {name} | {val} | {date} |")
     table = "\n".join(rows)
-    return f"""### Recent Entries
+    return f"""### 🕐 Recent Entries
 | | Name | Value | Date |
 |-|------|-------|------|
 {table}
@@ -130,7 +135,7 @@ def _render_recent():
 
 def build_discover_tab():
     with gr.Column():
-        gr.Markdown("## Discover Sweepstakes")
+        gr.Markdown("## 🔍 Discover Sweepstakes")
 
         with gr.Row():
             with gr.Column(scale=2):
@@ -147,8 +152,8 @@ def build_discover_tab():
                     placeholder="cash, travel, electronics",
                 )
 
-        discover_btn = gr.Button("Start Discovery", variant="primary", size="lg")
-        stop_btn = gr.Button("Stop", variant="stop", size="sm", visible=False)
+        discover_btn = gr.Button("🚀 Start Discovery", variant="primary", size="lg")
+        stop_btn = gr.Button("⏹ Stop", variant="stop", size="sm", visible=False)
 
         progress_box = gr.Textbox(label="Live Progress", lines=12, interactive=False)
         results_md = gr.Markdown("*Press Start to discover sweepstakes*")
@@ -200,7 +205,7 @@ def _run_discovery(sites_text, max_entries, categories):
             parts.append(f"🌐 {url[:60]}")
         _log(" | ".join(parts))
 
-    from sweepstakes.agent import register_step_callback, clear_step_callbacks, discover_sweepstakes
+    from sweepstakes.agent import register_step_callback, clear_step_callbacks, discover_sweepstakes, cost_tracker
 
     clear_step_callbacks()
     register_step_callback(step_callback)
@@ -210,7 +215,7 @@ def _run_discovery(sites_text, max_entries, categories):
         results = loop.run_until_complete(discover_sweepstakes(_config, _profile, _tracker, on_step=None))
         loop.close()
     except Exception as e:
-        _log(f"Error: {e}")
+        _log(f"❌ Error: {e}")
         results = []
 
     _running = False
@@ -230,6 +235,7 @@ def _run_discovery(sites_text, max_entries, categories):
 
     md = _render_discovered()
     _log(f"Discovery complete: {len(_discovered)} sweepstakes found")
+    _log(f"Discovery cost: ${cost_tracker.total_cost:.4f}")
     return md, _progress_text(), gr.update(visible=True), gr.update(visible=False), gr.update(choices=_get_entry_choices(), value=[])
 
 
@@ -237,7 +243,7 @@ def _render_discovered():
     if not _discovered:
         return "### No sweepstakes found\nTry different sites or broader categories."
 
-    parts = [f"### Found {len(_discovered)} Sweepstakes\n"]
+    parts = [f"### 🎯 Found {len(_discovered)} Sweepstakes\n"]
     for i, sw in enumerate(_discovered, 1):
         name = sw.get("name", "Unknown")
         url = sw.get("url", "")
@@ -276,7 +282,7 @@ def _render_discovered():
 
 def build_enter_tab():
     with gr.Column():
-        gr.Markdown("## Enter Sweepstakes")
+        gr.Markdown("## 📝 Enter Sweepstakes")
 
         with gr.Row():
             with gr.Column(scale=2):
@@ -285,13 +291,13 @@ def build_enter_tab():
                     label="Select to enter",
                     choices=_get_entry_choices(),
                 )
-                refresh_choices = gr.Button("Refresh list", size="sm")
+                refresh_choices = gr.Button("🔄 Refresh list", size="sm")
             with gr.Column(scale=1):
                 gr.Markdown("### — or enter by URL —")
                 url_input = gr.Textbox(label="Direct URL", placeholder="https://...")
                 url_enter_btn = gr.Button("Enter URL", size="sm")
 
-        enter_btn = gr.Button("Enter Selected", variant="primary", size="lg")
+        enter_btn = gr.Button("🚀 Enter Selected", variant="primary", size="lg")
         entry_progress = gr.Textbox(label="Entry Progress", lines=10, interactive=False)
         entry_result = gr.Markdown("")
 
@@ -336,26 +342,38 @@ def _run_entry_batch(selected):
                 thought = cs.next_goal or ""
         _log(f"Step {step}: {thought[:80]}" if thought else f"Step {step}")
 
-    from sweepstakes.agent import enter_sweepstakes, register_step_callback, clear_step_callbacks
+    from sweepstakes.agent import enter_sweepstakes, register_step_callback, clear_step_callbacks, cost_tracker, build_browser_profile
 
     clear_step_callbacks()
     register_step_callback(step_cb)
 
     loop = asyncio.new_event_loop()
-    for sel in selected:
-        idx = int(sel.split(".")[0]) - 1
-        if 0 <= idx < len(_discovered):
-            sw = _discovered[idx]
-            _log(f"\n▸ Entering: {sw.get('name', '?')}")
-            try:
-                ok = loop.run_until_complete(
-                    enter_sweepstakes(sw, _config, _profile, _tracker, on_step=None)
-                )
-                results.append((sw.get("name", "?"), ok))
-            except Exception as e:
-                _log(f"Error: {e}")
-                results.append((sw.get("name", "?"), False))
-    loop.close()
+
+    # Reuse a single browser session across all entries
+    browser_profile = build_browser_profile(_config)
+    session = BrowserSession(browser_profile=browser_profile)
+
+    try:
+        for sel in selected:
+            idx = int(sel.split(".")[0]) - 1
+            if 0 <= idx < len(_discovered):
+                sw = _discovered[idx]
+                _log(f"\n▸ Entering: {sw.get('name', '?')}")
+                try:
+                    ok = loop.run_until_complete(
+                        enter_sweepstakes(sw, _config, _profile, _tracker,
+                                         browser_session=session, on_step=None)
+                    )
+                    results.append((sw.get("name", "?"), ok))
+                except Exception as e:
+                    _log(f"❌ Error: {e}")
+                    results.append((sw.get("name", "?"), False))
+    finally:
+        try:
+            loop.run_until_complete(session.close())
+        except Exception:
+            pass
+        loop.close()
 
     md = "### Entry Results\n\n"
     for name, ok in results:
@@ -363,6 +381,7 @@ def _run_entry_batch(selected):
 
     stats = _tracker.get_stats()
     md += f"\n**Success rate:** {stats.get('success_rate', 'N/A')}"
+    md += f"\n**Session API cost:** ${cost_tracker.total_cost:.4f}"
     return md, _progress_text()
 
 
@@ -384,7 +403,7 @@ def _run_url_entry(url):
             enter_sweepstakes(sw, _config, _profile, _tracker, on_step=None)
         )
     except Exception as e:
-        _log(f"Error: {e}")
+        _log(f"❌ Error: {e}")
         ok = False
     loop.close()
 
@@ -395,14 +414,14 @@ def _run_url_entry(url):
 
 def build_history_tab():
     with gr.Column():
-        gr.Markdown("## Entry History")
+        gr.Markdown("## 📜 Entry History")
 
         with gr.Row():
             filter_dd = gr.Dropdown(
                 ["All", "Entered", "Failed", "Skipped"],
                 value="All", label="Filter",
             )
-            refresh_hist = gr.Button("Refresh", size="sm")
+            refresh_hist = gr.Button("🔄 Refresh", size="sm")
 
         history_md = gr.Markdown(_render_history("All"))
 
@@ -449,7 +468,7 @@ def _render_history(filter_status):
 
 def build_profile_tab():
     with gr.Column():
-        gr.Markdown("## Entrant Profile")
+        gr.Markdown("## 👤 Entrant Profile")
         gr.Markdown("*Your info is stored locally in `.env` and masked from the AI via `sensitive_data`.*")
 
         with gr.Row():
@@ -470,7 +489,7 @@ def build_profile_tab():
                 twitter = gr.Textbox(label="Twitter Handle", value=_profile.twitter_handle)
                 facebook = gr.Textbox(label="Facebook Name", value=_profile.facebook_name)
 
-        save_btn = gr.Button("Save Profile", variant="primary")
+        save_btn = gr.Button("💾 Save Profile", variant="primary")
         save_status = gr.Markdown("")
 
     inputs = [first, last, email, phone, dob, age, street, city, state, zipcode, country, instagram, twitter, facebook]
@@ -539,7 +558,7 @@ def _save_profile(first, last, email, phone, dob, age, street, city, state, zipc
 
 def build_settings_tab():
     with gr.Column():
-        gr.Markdown("## Settings")
+        gr.Markdown("## ⚙️ Settings")
 
         with gr.Row():
             with gr.Column():
@@ -575,7 +594,7 @@ def build_settings_tab():
                 lines=5,
             )
 
-        save_settings = gr.Button("Save Settings", variant="primary")
+        save_settings = gr.Button("💾 Save Settings", variant="primary")
         settings_status = gr.Markdown("")
 
     save_settings.click(
@@ -598,7 +617,7 @@ def _save_settings(model, max_e, min_sc, headless, demo, min_age, country, sites
     _config.aggregator_sites = [s.strip() for s in sites.strip().split("\n") if s.strip()]
     _config.trusted_sponsors = [s.strip().lower() for s in sponsors.strip().split("\n") if s.strip()]
 
-    # Save settings to .env
+    # Save all settings to .env
     env_path = Path(__file__).resolve().parent / ".env"
     existing = {}
     if env_path.exists():
@@ -626,21 +645,21 @@ def create_app():
         font=gr.themes.GoogleFont("Inter"),
     )
     with gr.Blocks(
-        title="Sweepstakes Agent",
+        title="Sweepstakes Agent v2",
         theme=theme,
     ) as app:
         with gr.Tabs():
-            with gr.Tab("Dashboard"):
+            with gr.Tab("🏠 Dashboard"):
                 build_dashboard()
-            with gr.Tab("Discover"):
+            with gr.Tab("🔍 Discover"):
                 discover_btn, stop_btn, progress_box, results_md, sites_box, max_slider, cats_box = build_discover_tab()
-            with gr.Tab("Enter"):
+            with gr.Tab("📝 Enter"):
                 enter_choices, entry_progress, entry_result = build_enter_tab()
-            with gr.Tab("History"):
+            with gr.Tab("📜 History"):
                 build_history_tab()
-            with gr.Tab("Profile"):
+            with gr.Tab("👤 Profile"):
                 build_profile_tab()
-            with gr.Tab("Settings"):
+            with gr.Tab("⚙️ Settings"):
                 build_settings_tab()
 
         # Wire discovery to also update enter_choices across tabs
