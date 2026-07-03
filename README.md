@@ -375,3 +375,8 @@ This tool is for educational and personal use. By using it, you agree to:
 - [Anthropic Claude](https://www.anthropic.com/) — LLM for intelligent web navigation
 - [Gradio](https://gradio.app/) — Web dashboard UI
 - [Pydantic](https://docs.pydantic.dev/) — Structured output validation
+
+
+## Support
+
+If you find this useful, consider supporting via [PayPal](https://paypal.me/noodlebake)
